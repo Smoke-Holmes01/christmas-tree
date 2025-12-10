@@ -1,4 +1,4 @@
-import { useState, useMemo, useRef, useEffect, Suspense } from 'react';
+import { useState, useMemo, useRef, useEffect, useCallback, Suspense } from 'react';
 import { Canvas, useFrame, extend } from '@react-three/fiber';
 import {
   OrbitControls,
@@ -18,7 +18,6 @@ import { GestureRecognizer, FilesetResolver, DrawingUtils } from "@mediapipe/tas
 
 // --- 动态生成照片列表 (top.jpg + 1.jpg 到 30.jpg) ---
 const TOTAL_NUMBERED_PHOTOS = 30;
-// 修改：将 top.jpg 加入到数组开头
 const bodyPhotoPaths = [
   '/photos/top.jpg',
   ...Array.from({ length: TOTAL_NUMBERED_PHOTOS }, (_, i) => `/photos/${i + 1}.jpg`)
@@ -422,11 +421,132 @@ const Experience = ({ sceneState, rotationSpeed }: { sceneState: 'CHAOS' | 'FORM
   );
 };
 
+// --- Helper: 计算两点之间的距离 ---
+const getDistance = (p1: { x: number; y: number; z: number }, p2: { x: number; y: number; z: number }) => {
+  return Math.sqrt(
+    Math.pow(p1.x - p2.x, 2) +
+    Math.pow(p1.y - p2.y, 2) +
+    Math.pow(p1.z - p2.z, 2)
+  );
+};
+
+// --- Helper: 检测三指捏合 (大拇指、食指、中指) ---
+const detectThreeFingerPinch = (landmarks: { x: number; y: number; z: number }[]): boolean => {
+  // 手部关键点索引:
+  // 4: THUMB_TIP (大拇指尖)
+  // 8: INDEX_FINGER_TIP (食指尖)
+  // 12: MIDDLE_FINGER_TIP (中指尖)
+  const thumbTip = landmarks[4];
+  const indexTip = landmarks[8];
+  const middleTip = landmarks[12];
+
+  // 计算三个指尖之间的距离
+  const thumbToIndex = getDistance(thumbTip, indexTip);
+  const thumbToMiddle = getDistance(thumbTip, middleTip);
+  const indexToMiddle = getDistance(indexTip, middleTip);
+
+  // 阈值：当三个指尖距离都小于此值时认为是捏合状态
+  const pinchThreshold = 0.08;
+
+  return thumbToIndex < pinchThreshold && thumbToMiddle < pinchThreshold && indexToMiddle < pinchThreshold;
+};
+
+// --- Component: 放大照片覆盖层 ---
+const PhotoOverlay = ({ photoPath, onClose }: { photoPath: string | null; onClose: () => void }) => {
+  const [isVisible, setIsVisible] = useState(false);
+
+  useEffect(() => {
+    if (photoPath) {
+      // 延迟一帧触发动画
+      requestAnimationFrame(() => setIsVisible(true));
+    } else {
+      setIsVisible(false);
+    }
+  }, [photoPath]);
+
+  if (!photoPath) return null;
+
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: 'fixed',
+        top: 0,
+        left: 0,
+        width: '100vw',
+        height: '100vh',
+        backgroundColor: isVisible ? 'rgba(0, 0, 0, 0.85)' : 'rgba(0, 0, 0, 0)',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        zIndex: 1000,
+        cursor: 'pointer',
+        transition: 'background-color 0.4s ease-out',
+      }}
+    >
+      {/* 拍立得边框 */}
+      <div
+        style={{
+          backgroundColor: '#FFFAF0',
+          padding: '20px 20px 60px 20px',
+          boxShadow: isVisible ? '0 25px 80px rgba(255, 215, 0, 0.3), 0 0 60px rgba(255, 215, 0, 0.2)' : 'none',
+          transform: isVisible ? 'scale(1) rotate(0deg)' : 'scale(0.3) rotate(-15deg)',
+          opacity: isVisible ? 1 : 0,
+          transition: 'all 0.5s cubic-bezier(0.34, 1.56, 0.64, 1)',
+        }}
+      >
+        <img
+          src={photoPath}
+          alt="Selected memory"
+          style={{
+            maxWidth: '70vmin',
+            maxHeight: '60vmin',
+            objectFit: 'contain',
+            display: 'block',
+          }}
+        />
+        {/* 拍立得底部文字 */}
+        <div
+          style={{
+            textAlign: 'center',
+            marginTop: '15px',
+            fontFamily: "'Caveat', cursive, serif",
+            fontSize: '18px',
+            color: '#333',
+            letterSpacing: '1px',
+          }}
+        >
+          ✨ Merry Christmas ✨
+        </div>
+      </div>
+
+      {/* 提示文字 */}
+      <div
+        style={{
+          position: 'absolute',
+          bottom: '40px',
+          left: '50%',
+          transform: 'translateX(-50%)',
+          color: 'rgba(255, 215, 0, 0.6)',
+          fontSize: '12px',
+          letterSpacing: '3px',
+          textTransform: 'uppercase',
+          opacity: isVisible ? 1 : 0,
+          transition: 'opacity 0.5s ease-out 0.3s',
+        }}
+      >
+        张开手掌关闭 / Click to close
+      </div>
+    </div>
+  );
+};
+
 // --- Gesture Controller ---
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-const GestureController = ({ onGesture, onMove, onStatus, debugMode }: any) => {
+const GestureController = ({ onGesture, onMove, onStatus, onPinch, debugMode }: any) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const isPinchingRef = useRef(false); // 用于防止重复触发
 
   useEffect(() => {
     let gestureRecognizer: GestureRecognizer;
@@ -476,24 +596,47 @@ const GestureController = ({ onGesture, onMove, onStatus, debugMode }: any) => {
                 }
             } else if (ctx && !debugMode) ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
 
-            if (results.gestures.length > 0) {
-              const name = results.gestures[0][0].categoryName; const score = results.gestures[0][0].score;
-              if (score > 0.4) {
-                 if (name === "Open_Palm") onGesture("CHAOS"); if (name === "Closed_Fist") onGesture("FORMED");
-                 if (debugMode) onStatus(`DETECTED: ${name}`);
+            // 检测手部关键点
+            if (results.landmarks && results.landmarks.length > 0) {
+              const landmarks = results.landmarks[0];
+              
+              // 检测三指捏合
+              const isPinching = detectThreeFingerPinch(landmarks);
+              
+              if (isPinching && !isPinchingRef.current) {
+                // 捏合刚开始
+                isPinchingRef.current = true;
+                onPinch(true);
+                if (debugMode) onStatus("DETECTED: THREE FINGER PINCH");
+              } else if (!isPinching && isPinchingRef.current) {
+                // 捏合结束（手张开）
+                isPinchingRef.current = false;
+                onPinch(false);
               }
-              if (results.landmarks.length > 0) {
-                const speed = (0.5 - results.landmarks[0][0].x) * 0.15;
-                onMove(Math.abs(speed) > 0.01 ? speed : 0);
+
+              // 原有手势检测
+              if (results.gestures.length > 0) {
+                const name = results.gestures[0][0].categoryName; const score = results.gestures[0][0].score;
+                if (score > 0.4 && !isPinching) {
+                   if (name === "Open_Palm") onGesture("CHAOS"); if (name === "Closed_Fist") onGesture("FORMED");
+                   if (debugMode) onStatus(`DETECTED: ${name}`);
+                }
               }
-            } else { onMove(0); if (debugMode) onStatus("AI READY: NO HAND"); }
+
+              // 手部位置控制旋转
+              const speed = (0.5 - landmarks[0].x) * 0.15;
+              onMove(Math.abs(speed) > 0.01 ? speed : 0);
+            } else { 
+              onMove(0); 
+              if (debugMode) onStatus("AI READY: NO HAND"); 
+            }
         }
         requestRef = requestAnimationFrame(predictWebcam);
       }
     };
     setup();
     return () => cancelAnimationFrame(requestRef);
-  }, [onGesture, onMove, onStatus, debugMode]);
+  }, [onGesture, onMove, onStatus, onPinch, debugMode]);
 
   return (
     <>
@@ -509,6 +652,28 @@ export default function GrandTreeApp() {
   const [rotationSpeed, setRotationSpeed] = useState(0);
   const [aiStatus, setAiStatus] = useState("INITIALIZING...");
   const [debugMode, setDebugMode] = useState(false);
+  const [selectedPhoto, setSelectedPhoto] = useState<string | null>(null);
+  
+  // 使用 ref 来跟踪 selectedPhoto，避免 useCallback 依赖变化
+  const selectedPhotoRef = useRef(selectedPhoto);
+  selectedPhotoRef.current = selectedPhoto;
+
+  // 处理三指捏合 - 使用 useCallback 避免函数引用变化导致 useEffect 重复执行
+  const handlePinch = useCallback((isPinching: boolean) => {
+    if (isPinching && !selectedPhotoRef.current) {
+      // 随机选择一张照片
+      const randomIndex = Math.floor(Math.random() * CONFIG.photos.body.length);
+      setSelectedPhoto(CONFIG.photos.body[randomIndex]);
+    } else if (!isPinching && selectedPhotoRef.current) {
+      // 手张开时关闭照片
+      setSelectedPhoto(null);
+    }
+  }, []);
+
+  // 关闭照片覆盖层
+  const closePhotoOverlay = useCallback(() => {
+    setSelectedPhoto(null);
+  }, []);
 
   return (
     <div style={{ width: '100vw', height: '100vh', backgroundColor: '#000', position: 'relative', overflow: 'hidden' }}>
@@ -517,7 +682,10 @@ export default function GrandTreeApp() {
             <Experience sceneState={sceneState} rotationSpeed={rotationSpeed} />
         </Canvas>
       </div>
-      <GestureController onGesture={setSceneState} onMove={setRotationSpeed} onStatus={setAiStatus} debugMode={debugMode} />
+      <GestureController onGesture={setSceneState} onMove={setRotationSpeed} onStatus={setAiStatus} onPinch={handlePinch} debugMode={debugMode} />
+
+      {/* 照片放大覆盖层 */}
+      <PhotoOverlay photoPath={selectedPhoto} onClose={closePhotoOverlay} />
 
       {/* UI - Stats */}
       <div style={{ position: 'absolute', bottom: '30px', left: '40px', color: '#888', zIndex: 10, fontFamily: 'sans-serif', userSelect: 'none' }}>
