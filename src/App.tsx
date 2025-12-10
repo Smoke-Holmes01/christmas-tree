@@ -122,14 +122,30 @@ const Foliage = ({ state }: { state: 'CHAOS' | 'FORMED' }) => {
   );
 };
 
-// --- Component: Photo Ornaments (Double-Sided Polaroid) ---
+// --- Component: Photo Ornaments (变形效果：照片 ↔ 发光粒子) ---
 const PhotoOrnaments = ({ state }: { state: 'CHAOS' | 'FORMED' }) => {
   const textures = useTexture(CONFIG.photos.body);
   const count = CONFIG.counts.ornaments;
   const groupRef = useRef<THREE.Group>(null);
+  
+  // 存储每个元素的变形进度 (0 = 照片, 1 = 发光粒子)
+  const morphProgressRef = useRef<number[]>(new Array(count).fill(0));
 
   const borderGeometry = useMemo(() => new THREE.PlaneGeometry(1.2, 1.5), []);
   const photoGeometry = useMemo(() => new THREE.PlaneGeometry(1, 1), []);
+  const glowGeometry = useMemo(() => new THREE.SphereGeometry(0.25, 12, 12), []);
+  
+  // 发光粒子的颜色池 - 圣诞主题
+  const glowColors = useMemo(() => [
+    '#FFD700', // 金色
+    '#FF6B6B', // 红色
+    '#4ECDC4', // 青色
+    '#45B7D1', // 蓝色
+    '#96CEB4', // 薄荷绿
+    '#FFEAA7', // 淡黄
+    '#DDA0DD', // 梅红
+    '#98D8C8', // 薄荷
+  ], []);
 
   const data = useMemo(() => {
     return new Array(count).fill(0).map((_, i) => {
@@ -144,6 +160,7 @@ const PhotoOrnaments = ({ state }: { state: 'CHAOS' | 'FORMED' }) => {
       const baseScale = isBig ? 2.2 : 0.8 + Math.random() * 0.6;
       const weight = 0.8 + Math.random() * 1.2;
       const borderColor = CONFIG.colors.borders[Math.floor(Math.random() * CONFIG.colors.borders.length)];
+      const glowColor = glowColors[Math.floor(Math.random() * glowColors.length)];
 
       const rotationSpeed = {
         x: (Math.random() - 0.5) * 1.0,
@@ -152,18 +169,27 @@ const PhotoOrnaments = ({ state }: { state: 'CHAOS' | 'FORMED' }) => {
       };
       const chaosRotation = new THREE.Euler(Math.random()*Math.PI, Math.random()*Math.PI, Math.random()*Math.PI);
 
+      // 发光粒子的脉冲参数
+      const pulseSpeed = 1.5 + Math.random() * 2;
+      const pulseOffset = Math.random() * Math.PI * 2;
+
       return {
         chaosPos, targetPos, scale: baseScale, weight,
         textureIndex: i % textures.length,
         borderColor,
+        glowColor,
         currentPos: chaosPos.clone(),
         chaosRotation,
         rotationSpeed,
         wobbleOffset: Math.random() * 10,
-        wobbleSpeed: 0.5 + Math.random() * 0.5
+        wobbleSpeed: 0.5 + Math.random() * 0.5,
+        pulseSpeed,
+        pulseOffset,
+        // 变形延迟，让粒子依次变形而不是同时
+        morphDelay: Math.random() * 0.5
       };
     });
-  }, [textures, count]);
+  }, [textures, count, glowColors]);
 
   useFrame((stateObj, delta) => {
     if (!groupRef.current) return;
@@ -174,8 +200,48 @@ const PhotoOrnaments = ({ state }: { state: 'CHAOS' | 'FORMED' }) => {
       const objData = data[i];
       const target = isFormed ? objData.targetPos : objData.chaosPos;
 
+      // 更新变形进度 (FORMED 时变为粒子，CHAOS 时变回照片)
+      const targetMorph = isFormed ? 1 : 0;
+      const morphSpeed = 2.0; // 变形速度
+      morphProgressRef.current[i] = MathUtils.damp(
+        morphProgressRef.current[i], 
+        targetMorph, 
+        morphSpeed, 
+        delta
+      );
+      const morph = morphProgressRef.current[i];
+
       objData.currentPos.lerp(target, delta * (isFormed ? 0.8 * objData.weight : 0.5));
       group.position.copy(objData.currentPos);
+
+      // 获取子元素
+      const photoGroup = group.children[0] as THREE.Group; // 照片组
+      const glowMesh = group.children[1] as THREE.Mesh;    // 发光球
+
+      if (photoGroup && glowMesh) {
+        // 照片：随着 morph 增加而缩小并变透明
+        const photoScale = 1 - morph * 0.8; // 缩小到 20%
+        photoGroup.scale.setScalar(photoScale);
+        
+        // 更新照片材质透明度
+        photoGroup.traverse((child) => {
+          if ((child as THREE.Mesh).material) {
+            const mat = (child as THREE.Mesh).material as THREE.MeshStandardMaterial;
+            mat.opacity = 1 - morph;
+            mat.transparent = true;
+          }
+        });
+
+        // 发光球：随着 morph 增加而放大并变亮
+        const glowScale = morph * 0.6;
+        glowMesh.scale.setScalar(Math.max(0.01, glowScale)); // 避免 scale 为 0
+        
+        const glowMat = glowMesh.material as THREE.MeshStandardMaterial;
+        glowMat.opacity = morph * 0.85;
+        // 脉冲发光效果
+        const pulse = (Math.sin(time * objData.pulseSpeed + objData.pulseOffset) + 1) / 2;
+        glowMat.emissiveIntensity = morph * (0.8 + pulse * 1.2);
+      }
 
       if (isFormed) {
          const targetLookPos = new THREE.Vector3(group.position.x * 2, group.position.y + 0.5, group.position.z * 2);
@@ -198,34 +264,51 @@ const PhotoOrnaments = ({ state }: { state: 'CHAOS' | 'FORMED' }) => {
     <group ref={groupRef}>
       {data.map((obj, i) => (
         <group key={i} scale={[obj.scale, obj.scale, obj.scale]} rotation={state === 'CHAOS' ? obj.chaosRotation : [0,0,0]}>
-          {/* 正面 */}
-          <group position={[0, 0, 0.015]}>
-            <mesh geometry={photoGeometry}>
-              <meshStandardMaterial
-                map={textures[obj.textureIndex]}
-                roughness={0.5} metalness={0}
-                emissive={CONFIG.colors.white} emissiveMap={textures[obj.textureIndex]} emissiveIntensity={1.0}
-                side={THREE.FrontSide}
-              />
-            </mesh>
-            <mesh geometry={borderGeometry} position={[0, -0.15, -0.01]}>
-              <meshStandardMaterial color={obj.borderColor} roughness={0.9} metalness={0} side={THREE.FrontSide} />
-            </mesh>
+          {/* 照片组 */}
+          <group>
+            {/* 正面 */}
+            <group position={[0, 0, 0.015]}>
+              <mesh geometry={photoGeometry}>
+                <meshStandardMaterial
+                  map={textures[obj.textureIndex]}
+                  roughness={0.5} metalness={0}
+                  emissive={CONFIG.colors.white} emissiveMap={textures[obj.textureIndex]} emissiveIntensity={1.0}
+                  side={THREE.FrontSide}
+                  transparent
+                />
+              </mesh>
+              <mesh geometry={borderGeometry} position={[0, -0.15, -0.01]}>
+                <meshStandardMaterial color={obj.borderColor} roughness={0.9} metalness={0} side={THREE.FrontSide} transparent />
+              </mesh>
+            </group>
+            {/* 背面 */}
+            <group position={[0, 0, -0.015]} rotation={[0, Math.PI, 0]}>
+              <mesh geometry={photoGeometry}>
+                <meshStandardMaterial
+                  map={textures[obj.textureIndex]}
+                  roughness={0.5} metalness={0}
+                  emissive={CONFIG.colors.white} emissiveMap={textures[obj.textureIndex]} emissiveIntensity={1.0}
+                  side={THREE.FrontSide}
+                  transparent
+                />
+              </mesh>
+              <mesh geometry={borderGeometry} position={[0, -0.15, -0.01]}>
+                <meshStandardMaterial color={obj.borderColor} roughness={0.9} metalness={0} side={THREE.FrontSide} transparent />
+              </mesh>
+            </group>
           </group>
-          {/* 背面 */}
-          <group position={[0, 0, -0.015]} rotation={[0, Math.PI, 0]}>
-            <mesh geometry={photoGeometry}>
-              <meshStandardMaterial
-                map={textures[obj.textureIndex]}
-                roughness={0.5} metalness={0}
-                emissive={CONFIG.colors.white} emissiveMap={textures[obj.textureIndex]} emissiveIntensity={1.0}
-                side={THREE.FrontSide}
-              />
-            </mesh>
-            <mesh geometry={borderGeometry} position={[0, -0.15, -0.01]}>
-              <meshStandardMaterial color={obj.borderColor} roughness={0.9} metalness={0} side={THREE.FrontSide} />
-            </mesh>
-          </group>
+          
+          {/* 发光粒子球 */}
+          <mesh geometry={glowGeometry} scale={0.01}>
+            <meshStandardMaterial 
+              color={obj.glowColor}
+              emissive={obj.glowColor}
+              emissiveIntensity={0}
+              transparent
+              opacity={0}
+              toneMapped={false}
+            />
+          </mesh>
         </group>
       ))}
     </group>
